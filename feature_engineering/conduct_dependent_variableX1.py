@@ -13,8 +13,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # 配置
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = 'F:/WLJ/Weak-Link-Effect-Research/data'
 
 # 输入文件
 BALANCED_DATASET = os.path.join(DATA_DIR, "RES01_balanced_dataset_1_1_20250913_225013.csv")
@@ -35,25 +34,27 @@ print(f"  全部链接数: {len(df_links_all):,}")
 # 2. 提取样本中涉及的所有边对和时间窗口
 print("\n[2] 提取样本涉及的边...")
 
-# 获取样本中所有唯一的(窗口, 节点对)组合
-sample_edges = set()
-for _, row in df_samples.iterrows():
-    # 注意：样本使用的是window_t作为当前时间窗口
-    key1 = (row['window_t_start'], row['window_t_end'], row['node_u'], row['node_v'])
-    key2 = (row['window_t_start'], row['window_t_end'], row['node_v'], row['node_u'])  # 反向
-    sample_edges.add(key1)
-    sample_edges.add(key2)
+# 使用向量化操作创建样本边对DataFrame
+print("  创建样本边对表...")
+sample_edges_forward = df_samples[['window_t_start', 'window_t_end', 'node_u', 'node_v']].copy()
+sample_edges_forward.columns = ['window_start', 'window_end', 'node_u', 'node_v']
 
-print(f"  样本涉及的唯一边对数: {len(sample_edges):,}")
+sample_edges_reverse = df_samples[['window_t_start', 'window_t_end', 'node_v', 'node_u']].copy()
+sample_edges_reverse.columns = ['window_start', 'window_end', 'node_u', 'node_v']
 
-# 过滤df_links，只保留样本中涉及的边
-df_links_filtered = []
-for _, row in df_links_all.iterrows():
-    key = (row['window_start'], row['window_end'], row['node_u'], row['node_v'])
-    if key in sample_edges:
-        df_links_filtered.append(row)
+# 合并正向和反向边，并去重
+sample_edges_df = pd.concat([sample_edges_forward, sample_edges_reverse], ignore_index=True)
+sample_edges_df = sample_edges_df.drop_duplicates()
+print(f"  样本涉及的唯一边对数: {len(sample_edges_df):,}")
 
-df_links = pd.DataFrame(df_links_filtered)
+# 过滤df_links，只保留样本中涉及的边（使用merge，无循环）
+print("  过滤链接数据...")
+df_links = pd.merge(
+    df_links_all,
+    sample_edges_df,
+    on=['window_start', 'window_end', 'node_u', 'node_v'],
+    how='inner'
+)
 print(f"  过滤后链接数: {len(df_links):,}")
 
 # 3. 获取样本涉及的时间窗口
@@ -119,57 +120,86 @@ for idx, (w_start, w_end) in enumerate(sample_windows.values, 1):
     print(f"    计算边介数中心性...")
     if G.number_of_edges() > 0:
         edge_betweenness = nx.edge_betweenness_centrality(G, weight='weight', normalized=True)
-        # 创建双向查找
-        edge_betweenness_dict = {}
-        for (u, v), val in edge_betweenness.items():
-            edge_betweenness_dict[(u, v)] = val
-            edge_betweenness_dict[(v, u)] = val
+        print(f"    边介数中心性整体计算完成...")
+        # 使用字典推导式创建双向查找（更快）
+        edge_betweenness_dict = {
+            **{(u, v): val for (u, v), val in edge_betweenness.items()},
+            **{(v, u): val for (u, v), val in edge_betweenness.items()}
+        }
     else:
         edge_betweenness_dict = {}
     
-    # 特征4: 技术距离（Jaccard）
+    # 特征4: 技术距离（Jaccard）- 优化版
     print(f"    计算技术距离...")
+
+    # 预计算所有节点的邻居
     neighbors = {node: set(G.neighbors(node)) for node in G.nodes()}
-    
-    def compute_jaccard_distance(u, v):
-        if u not in neighbors or v not in neighbors:
-            return 1.0
-        neighbors_u = neighbors[u]
-        neighbors_v = neighbors[v]
+
+    # 批量计算Jaccard距离
+    def batch_compute_jaccard_distance(edge_pairs):
+        """批量计算多对节点的Jaccard距离"""
+        jaccard_distances = {}
         
-        # 处理特殊情况
-        if len(neighbors_u) == 0 and len(neighbors_v) == 0:
-            return 1.0  # 两个孤立节点
+        for u, v in edge_pairs:
+            if u not in neighbors or v not in neighbors:
+                jaccard_distances[(u, v)] = 1.0
+                continue
+                
+            neighbors_u = neighbors[u]
+            neighbors_v = neighbors[v]
+            
+            # 处理特殊情况
+            if len(neighbors_u) == 0 and len(neighbors_v) == 0:
+                jaccard_distances[(u, v)] = 1.0  # 两个孤立节点
+                continue
+            
+            union_size = len(neighbors_u | neighbors_v)
+            if union_size == 0:
+                jaccard_distances[(u, v)] = 1.0
+                continue
+            
+            jaccard_sim = len(neighbors_u & neighbors_v) / union_size
+            jaccard_distances[(u, v)] = 1 - jaccard_sim
         
-        union_size = len(neighbors_u | neighbors_v)
-        if union_size == 0:
-            return 1.0
-        
-        jaccard_sim = len(neighbors_u & neighbors_v) / union_size
-        return 1 - jaccard_sim
-    
-    # 为该窗口的每个样本计算特征
+        return jaccard_distances
+
+    # 获取该窗口所有需要计算的边对
+    window_edge_pairs = list(zip(
+        df_samples.loc[window_samples.index, 'node_u'],
+        df_samples.loc[window_samples.index, 'node_v']
+    ))
+
+    # 批量计算所有Jaccard距离
+    jaccard_distances = batch_compute_jaccard_distance(window_edge_pairs)
+
+    # 使用向量化操作批量赋值所有特征
+    print(f"    批量赋值特征...")
+
+    # 准备批量数据
+    link_strengths = []
+    degree_differences = []
+    betweennesses = []
+    tech_distances = []
+
     for idx_sample in window_samples.index:
         u = df_samples.loc[idx_sample, 'node_u']
         v = df_samples.loc[idx_sample, 'node_v']
         
-        # 链接强度
-        link_str = link_strength_dict.get((u, v), 0)  # 如果不存在则为0
-        df_samples.loc[idx_sample, 'link_strength'] = link_str
+        link_strengths.append(link_strength_dict.get((u, v), 0))
         
-        # 度差
         deg_u = degrees.get(u, 0)
         deg_v = degrees.get(v, 0)
-        df_samples.loc[idx_sample, 'degree_difference'] = abs(deg_u - deg_v)
+        degree_differences.append(abs(deg_u - deg_v))
         
-        # 边介数中心性
-        betw = edge_betweenness_dict.get((u, v), 0)
-        df_samples.loc[idx_sample, 'betweenness'] = betw
-        
-        # 技术距离
-        tech_dist = compute_jaccard_distance(u, v)
-        df_samples.loc[idx_sample, 'tech_distance'] = tech_dist
-    
+        betweennesses.append(edge_betweenness_dict.get((u, v), 0))
+        tech_distances.append(jaccard_distances.get((u, v), 1.0))
+
+    # 批量赋值（比逐行loc快很多）
+    df_samples.loc[window_samples.index, 'link_strength'] = link_strengths
+    df_samples.loc[window_samples.index, 'degree_difference'] = degree_differences
+    df_samples.loc[window_samples.index, 'betweenness'] = betweennesses
+    df_samples.loc[window_samples.index, 'tech_distance'] = tech_distances
+
     print(f"    窗口 {w_start}-{w_end} 特征计算完成")
 
 # 6. 特征后处理
