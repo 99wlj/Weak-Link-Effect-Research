@@ -1,111 +1,274 @@
+"""
+基本特征X1计算脚本（优化版）
+基于平衡数据集计算四个基本特征：链接强度、度差、边介数中心性、技术距离
+采用批量计算和向量化操作，避免循环，提高计算效率
+"""
+
 import pandas as pd
-import datetime
-import os
+import numpy as np
 import networkx as nx
-from node2vec import Node2Vec
-from sklearn.metrics.pairwise import cosine_similarity
+from datetime import datetime
+import os
+import warnings
+warnings.filterwarnings('ignore')
 
-# 输入数据
-base_dir = r"F:\WLJ\Weak-Link-Effect-Research"
-data_dir = os.path.join(base_dir, "data")
-csv_file = os.path.join(data_dir, "Keyword_LinkStrength_ByWindow_20250903_212630.csv")
+# 配置
+DATA_DIR = 'F:/WLJ/Weak-Link-Effect-Research/data'
 
-df = pd.read_csv(csv_file)
+# 输入文件
+BALANCED_DATASET = os.path.join(DATA_DIR, "RES01_balanced_dataset_1_1_20250913_225013.csv")
+LINK_STRENGTH_FILE = os.path.join(DATA_DIR, "Keyword_LinkStrength_ByWindow_20250903_212630.csv")
 
-all_edges_features = []
+print("=" * 80)
+print("基本特征X1计算")
+print("=" * 80)
 
-# 遍历每个时间窗口
-windows = df[['window_start','window_end']].drop_duplicates().values.tolist()
+# 1. 读取数据
+print("\n[1] 读取数据...")
+df_samples = pd.read_csv(BALANCED_DATASET)
+df_links = pd.read_csv(LINK_STRENGTH_FILE)
 
-for idx, (w_start, w_end) in enumerate(windows, 1):
-    print(f"\n==== 处理第 {idx}/{len(windows)} 个窗口: {w_start}-{w_end} ====")
+print(f"  样本数: {len(df_samples):,}")
+print(f"  链接数: {len(df_links):,}")
 
-    df_window = df[(df['window_start']==w_start) & (df['window_end']==w_end)]
+# 2. 预计算所有时间窗口的网络特征
+print("\n[2] 批量计算网络特征...")
 
-    # 用已有边数据构建网络
+# 获取所有唯一的时间窗口
+windows = df_links[['window_start', 'window_end']].drop_duplicates()
+print(f"  时间窗口数: {len(windows)}")
+
+# 存储所有窗口的特征
+all_features = []
+
+for idx, (w_start, w_end) in enumerate(windows.values, 1):
+    print(f"\n  处理窗口 {idx}/{len(windows)}: {w_start}-{w_end}")
+    
+    # 获取该窗口的所有边
+    df_window = df_links[(df_links['window_start'] == w_start) & 
+                         (df_links['window_end'] == w_end)]
+    
+    # 构建网络
     G = nx.Graph()
-    for _, row in df_window.iterrows():
-        u, v = row['node_u'], row['node_v']
-        w = row['link_strength']
-        G.add_edge(u, v, weight=w)
-
-    print(f"构建网络完成，节点数: {G.number_of_nodes()}，边数: {G.number_of_edges()}")
-
-    # 计算节点度（为了计算度差）
+    edge_list = df_window[['node_u', 'node_v', 'link_strength']].values
+    G.add_weighted_edges_from(edge_list, weight='weight')
+    
+    print(f"    节点数: {G.number_of_nodes()}, 边数: {G.number_of_edges()}")
+    
+    # === 批量计算特征 ===
+    
+    # 特征1: 链接强度（直接从df_window获取）
+    link_strengths = df_window.set_index(['node_u', 'node_v'])['link_strength'].to_dict()
+    
+    # 特征2: 度差（向量化计算）
     degrees = dict(G.degree(weight='weight'))
-
-    # 计算剩下三个特征
-    # 2. 度差
-    edge_deg_diff = { (u,v): abs(degrees[u] - degrees[v]) for u,v in G.edges() }
-
-    # 3. 边介数中心性
-    edge_betweenness = nx.edge_betweenness_centrality(G, weight='weight')
-
-    # 技术距离完善了三种方法，择优
-    # 4. 技术距离 (Node2Vec)
-
-    print("开始 Node2Vec 训练...")
-    node2vec = Node2Vec(G, dimensions=64, walk_length=10, num_walks=50, workers=1, seed=42)
-    model = node2vec.fit(window=10, min_count=1, batch_words=4)
-    embeddings = {node: model.wv.get_vector(node) for node in G.nodes()}
-
-    edge_tech_dist = {}
-    for u, v in G.edges():
-        sim = cosine_similarity([embeddings[u]], [embeddings[v]])[0][0]
-        dist = 1 - sim
-        edge_tech_dist[(u,v)] = dist
-
-    # 4替换方法一
-    # 4. 技术距离 (Jaccard 相似度)
-    print("开始计算 Jaccard 技术距离...")
-    edge_tech_dist = {}
-    for u, v in G.edges():
-        neighbors_u = set(G.neighbors(u))
-        neighbors_v = set(G.neighbors(v))
+    df_window['degree_u'] = df_window['node_u'].map(degrees)
+    df_window['degree_v'] = df_window['node_v'].map(degrees)
+    df_window['degree_difference'] = np.abs(df_window['degree_u'] - df_window['degree_v'])
+    
+    # 特征3: 边介数中心性（批量计算）
+    print(f"    计算边介数中心性...")
+    edge_betweenness = nx.edge_betweenness_centrality(G, weight='weight', normalized=True)
+    # 处理双向边
+    edge_betweenness_full = {}
+    for (u, v), val in edge_betweenness.items():
+        edge_betweenness_full[(u, v)] = val
+        edge_betweenness_full[(v, u)] = val
+    
+    df_window['betweenness'] = df_window.apply(
+        lambda row: edge_betweenness_full.get((row['node_u'], row['node_v']), 0), 
+        axis=1
+    )
+    
+    # 特征4: 技术距离（使用Jaccard，向量化计算）
+    print(f"    计算技术距离...")
+    
+    # 预计算所有节点的邻居集合
+    neighbors = {node: set(G.neighbors(node)) for node in G.nodes()}
+    
+    def compute_jaccard_distance(row):
+        u, v = row['node_u'], row['node_v']
+        if u not in neighbors or v not in neighbors:
+            return 1.0  # 最大距离
+        neighbors_u = neighbors[u]
+        neighbors_v = neighbors[v]
         union_size = len(neighbors_u | neighbors_v)
         if union_size == 0:
-            sim = 0
-        else:
-            sim = len(neighbors_u & neighbors_v) / union_size
-        edge_tech_dist[(u, v)] = 1 - sim  # 技术距离 = 1 - Jaccard相似度
-    print("Jaccard 技术距离计算完成")
+            return 1.0
+        jaccard_sim = len(neighbors_u & neighbors_v) / union_size
+        return 1 - jaccard_sim
+    
+    df_window['tech_distance'] = df_window.apply(compute_jaccard_distance, axis=1)
+    
+    # 保留需要的特征列
+    df_window_features = df_window[['window_start', 'window_end', 'node_u', 'node_v',
+                                    'link_strength', 'degree_difference', 
+                                    'betweenness', 'tech_distance']]
+    
+    all_features.append(df_window_features)
+    print(f"    特征计算完成")
 
-    # 4替换方法二
-    # 4. 技术距离 (最短路径)
-    print("开始计算最短路径技术距离...")
-    edge_tech_dist = {}
-    lengths = dict(nx.all_pairs_shortest_path_length(G, weight="weight"))
-    max_dist = max(max(d.values()) for d in lengths.values())  # 归一化用
+# 合并所有窗口的特征
+print("\n[3] 合并特征数据...")
+df_features = pd.concat(all_features, ignore_index=True)
+print(f"  总特征记录数: {len(df_features):,}")
 
-    for u, v in G.edges():
-        dist = lengths[u].get(v, max_dist)  # 如果不连通，取最大值
-        edge_tech_dist[(u, v)] = dist / max_dist  # 归一化到 [0,1]
-    print("最短路径技术距离计算完成")
+# 3. 将特征与样本数据关联
+print("\n[4] 特征与样本关联...")
 
+# 为了merge，需要确保窗口和节点对的匹配
+# 注意：样本中的window_t对应特征中的window
+df_samples_merge = df_samples.copy()
+df_features_merge = df_features.copy()
 
+# 重命名列以便merge
+df_features_merge = df_features_merge.rename(columns={
+    'window_start': 'window_t_start',
+    'window_end': 'window_t_end'
+})
 
-    # 保存结果
-    for u, v, data in G.edges(data=True):
-        row = df_window[((df_window['node_u']==u) & (df_window['node_v']==v)) | 
-                        ((df_window['node_u']==v) & (df_window['node_v']==u))]
-        strength_type = row['strength_type'].values[0]
+# 执行merge（左连接，保留所有样本）
+df_result = pd.merge(
+    df_samples_merge,
+    df_features_merge,
+    on=['window_t_start', 'window_t_end', 'node_u', 'node_v'],
+    how='left'
+)
 
-        all_edges_features.append({
-            'window_start': w_start,
-            'window_end': w_end,
-            'node_u': u,
-            'node_v': v,
-            'link_strength': row['link_strength'].values[0],  # 直接用原
-            'degree_difference': edge_deg_diff[(u,v)],
-            'betweenness': edge_betweenness[(u,v)],
-            'tech_distance': edge_tech_dist[(u,v)],
-        })
+# 检查是否有未匹配的样本（可能是边方向问题）
+unmatched_mask = df_result['link_strength'].isna()
+if unmatched_mask.any():
+    print(f"  发现 {unmatched_mask.sum()} 个未匹配样本，尝试反向匹配...")
+    
+    # 创建反向特征表（交换u和v）
+    df_features_reverse = df_features_merge.copy()
+    df_features_reverse[['node_u', 'node_v']] = df_features_reverse[['node_v', 'node_u']]
+    
+    # 对未匹配的样本进行反向merge
+    df_unmatched = df_samples_merge[unmatched_mask].copy()
+    df_unmatched_merged = pd.merge(
+        df_unmatched,
+        df_features_reverse,
+        on=['window_t_start', 'window_t_end', 'node_u', 'node_v'],
+        how='left'
+    )
+    
+    # 更新结果
+    df_result.loc[unmatched_mask] = df_unmatched_merged
 
-    print(f"窗口 {w_start}-{w_end} 处理完成，结果已记录。")
+# 4. 特征后处理
+print("\n[5] 特征后处理...")
 
-# 输出为DataFrame
-edges_df = pd.DataFrame(all_edges_features)
-timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-output_file = os.path.join(data_dir, f"Keyword_Network_Features_By_Window_{timestamp}.csv")
-edges_df.to_csv(output_file, index=False)
-print(f"\n输出完成：{output_file}")
+# 检查缺失值
+missing_counts = df_result[['link_strength', 'degree_difference', 
+                            'betweenness', 'tech_distance']].isna().sum()
+if missing_counts.sum() > 0:
+    print("  缺失值统计:")
+    for col, count in missing_counts.items():
+        if count > 0:
+            print(f"    {col}: {count} 个缺失值")
+    
+    # 填充缺失值（如果边在t时刻不存在，说明是新出现的弱链接）
+    df_result['link_strength'] = df_result['link_strength'].fillna(0)
+    df_result['degree_difference'] = df_result['degree_difference'].fillna(0)
+    df_result['betweenness'] = df_result['betweenness'].fillna(0)
+    df_result['tech_distance'] = df_result['tech_distance'].fillna(1)  # 最大距离
+
+# 5. 特征标准化（可选）
+print("\n[6] 特征标准化...")
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+
+# 选择需要标准化的特征
+feature_cols = ['link_strength', 'degree_difference', 'betweenness', 'tech_distance']
+
+# 保存原始值
+for col in feature_cols:
+    df_result[f'{col}_raw'] = df_result[col]
+
+# 使用MinMax标准化到[0,1]
+scaler = MinMaxScaler()
+df_result[feature_cols] = scaler.fit_transform(df_result[feature_cols])
+
+print("  特征已标准化到 [0, 1] 区间")
+
+# 6. 最终数据整理
+print("\n[7] 整理最终数据...")
+
+# 重新排序列
+final_cols = [
+    'sample_id', 'window_t_start', 'window_t_end', 
+    'window_t1_start', 'window_t1_end',
+    'node_u', 'node_v', 'y',
+    'link_strength', 'degree_difference', 'betweenness', 'tech_distance',
+    'link_strength_raw', 'degree_difference_raw', 'betweenness_raw', 'tech_distance_raw',
+    'window_label'
+]
+
+# 确保所有列都存在
+for col in final_cols:
+    if col not in df_result.columns and col != 'window_label':
+        print(f"  警告: 列 {col} 不存在")
+
+df_final = df_result[[col for col in final_cols if col in df_result.columns]]
+
+# 7. 保存结果
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+output_filename = f"RES02_features_X1_{timestamp}.csv"
+output_path = os.path.join(DATA_DIR, output_filename)
+
+df_final.to_csv(output_path, index=False, encoding='utf-8-sig')
+
+print("\n" + "=" * 80)
+print(f"✅ 特征X1计算完成！")
+print(f"   输出文件: {output_filename}")
+print(f"   路径: {output_path}")
+print(f"   样本数: {len(df_final):,}")
+print("=" * 80)
+
+# 8. 生成特征统计报告
+print("\n[8] 生成统计报告...")
+
+report_filename = f"RES02_features_X1_report_{timestamp}.txt"
+report_path = os.path.join(DATA_DIR, report_filename)
+
+with open(report_path, 'w', encoding='utf-8') as f:
+    f.write("基本特征X1计算报告\n")
+    f.write("=" * 80 + "\n\n")
+    f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    
+    f.write("数据概况:\n")
+    f.write(f"  样本总数: {len(df_final):,}\n")
+    f.write(f"  正样本数: {(df_final['y']==1).sum():,}\n")
+    f.write(f"  负样本数: {(df_final['y']==0).sum():,}\n\n")
+    
+    f.write("特征统计（标准化后）:\n")
+    stats = df_final[feature_cols].describe()
+    f.write(stats.to_string())
+    f.write("\n\n")
+    
+    f.write("特征统计（原始值）:\n")
+    raw_cols = [f'{col}_raw' for col in feature_cols]
+    stats_raw = df_final[raw_cols].describe()
+    f.write(stats_raw.to_string())
+    f.write("\n\n")
+    
+    f.write("特征相关性矩阵:\n")
+    corr_matrix = df_final[feature_cols].corr()
+    f.write(corr_matrix.to_string())
+    f.write("\n\n")
+    
+    f.write("特征说明:\n")
+    f.write("  1. link_strength: 链接强度（共现频率归一化）\n")
+    f.write("  2. degree_difference: 度差（节点度数差的绝对值）\n")
+    f.write("  3. betweenness: 边介数中心性\n")
+    f.write("  4. tech_distance: 技术距离（基于Jaccard相似度）\n")
+
+print(f"📊 统计报告已生成: {report_filename}")
+
+# 9. 快速验证
+print("\n[9] 数据验证...")
+print(f"  特征完整性: {(~df_final[feature_cols].isna().any(axis=1)).sum()}/{len(df_final)} 个样本特征完整")
+print(f"  Y值分布: Y=1: {(df_final['y']==1).sum()}, Y=0: {(df_final['y']==0).sum()}")
+
+print("\n✅ 所有任务完成！")
