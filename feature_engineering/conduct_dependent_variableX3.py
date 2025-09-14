@@ -15,6 +15,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import community as community_louvain
 import ast
 import time
+from tqdm import tqdm  # 确保正确导入
 from scipy import sparse
 from collections import defaultdict
 warnings.filterwarnings('ignore')
@@ -162,13 +163,23 @@ if all_innovations_text:
     batch_size = 256
     all_embeddings = []
     
-    for i in range(0, len(all_innovations_text), batch_size):
-        batch = all_innovations_text[i:i+batch_size]
-        batch_embeddings = model.encode(batch, show_progress_bar=False)
-        all_embeddings.append(batch_embeddings)
+    with tqdm(total=len(all_innovations_text), 
+                 desc="计算嵌入向量",
+                 unit="vec",
+                 bar_format="{l_bar}{bar:30}{r_bar}",
+                 leave=True) as pbar:
+        for i in range(0, len(all_innovations_text), batch_size):
+            batch = all_innovations_text[i:i+batch_size]
+            batch_embeddings = model.encode(batch, show_progress_bar=False)
+            all_embeddings.append(batch_embeddings)
+            pbar.update(len(batch))
+            pbar.set_postfix({
+                "当前批次": f"{i//batch_size + 1}/{(len(all_innovations_text)-1)//batch_size + 1}",
+                "向量维度": batch_embeddings.shape[1]
+            })
     
     innovation_embeddings = np.vstack(all_embeddings)
-    print(f"  Embedding矩阵形状: {innovation_embeddings.shape}")
+    print(f"  \n嵌入矩阵形状: {innovation_embeddings.shape} 总耗时: {pbar.format_dict['elapsed']:.1f}s")
 else:
     innovation_embeddings = np.array([])
 
