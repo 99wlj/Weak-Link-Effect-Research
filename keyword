@@ -1,1 +1,66 @@
+import os
+import pandas as pd
+import time
+from dashscope import Generation
+
+# 读取 CSV 文件
+df = pd.read_csv("C:/Users/TongYutong/Desktop/202507-202508/data3/UAV_03_ID_APPLN_INFO_TEXT_part_error.csv")
+
+# 存储每个摘要的分析结果
+results = []
+
+# 读取txt文件中的system内容
+def read_system_content(txt_file_path):
+    with open(txt_file_path, 'r', encoding='utf-8') as file:
+        return file.read().strip()
+
+# 读取system内容
+system_content = read_system_content("C:/Users/TongYutong/Desktop/202507-202508/AI-prompt.txt")
+
+# 循环遍历每一行并调用通义千问 API
+for index, row in df.iterrows():
+    file_content = row['appln_abstract']  # 获取当前行的摘要内容
+    # 读取system内容
+    system_content = read_system_content("C:/Users/TongYutong/Desktop/202507-202508/AI-prompt.txt")
+    # 设置消息内容
+    messages = [
+        {'role': 'system', 'content': f'\n{system_content}\n'},
+        {'role': 'user', 'content': f"\n{file_content}\n"
+
+                 }
+    ]
+    # 记录开始时间
+    start_time = time.time()
+
+    # 调用 API
+    try:
+        response = Generation.call(
+            api_key=os.getenv("DASHSCOPE_API_KEY"),  # 使用环境变量中的 API Key
+            model="qwen-plus-0112",
+            messages=messages,
+            result_format="message"
+        )
+
+        # 记录结束时间
+        end_time = time.time()
+        response_time = end_time - start_time  # 计算响应时间
+
+        # 输出响应时间
+        print(f"API 请求响应时间 (第 {index + 1} 行): {response_time:.2f} 秒")
+
+        # 获取并保存分析结果
+        if response.status_code == 200:
+            results.append(response.output.choices[0].message.content)
+        else:
+            results.append(f"错误: {response.status_code}, {response.message}")
+
+    except Exception as e:
+        # 捕获异常并记录
+        results.append(f"错误: {str(e)}")
+        print(f"API 调用出错，第 {index + 1} 行: {str(e)}")
+
+# 将分析结果保存到 CSV 文件
+df['Result'] = results
+df.to_csv("C:/Users/TongYutong/Desktop/202507-202508/data3/UAV_03_ID_APPLN_INFO_TEXT_result_new_part_error.csv", index=False,
+          encoding='utf-8-sig')
 
